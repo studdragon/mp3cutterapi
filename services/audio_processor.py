@@ -1,7 +1,6 @@
 """All audio processing functions. Each takes input path + params, returns output path."""
 
 import json
-import math
 import os
 import subprocess
 import zipfile
@@ -38,6 +37,32 @@ def _run_ffmpeg(args: list[str]) -> None:
     )
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg error: {result.stderr[:500]}")
+
+
+def _ffprobe_path() -> str:
+    base = os.path.basename(settings.ffmpeg_path)
+    probe = base.replace("ffmpeg", "ffprobe")
+    directory = os.path.dirname(settings.ffmpeg_path)
+    return os.path.join(directory, probe) if directory else probe
+
+
+def _get_audio_info(path: str) -> dict:
+    """Return {'duration': float (s), 'sample_rate': int (Hz)} via ffprobe."""
+    result = subprocess.run(
+        [_ffprobe_path(), "-v", "quiet", "-print_format", "json",
+         "-show_streams", "-select_streams", "a:0", path],
+        capture_output=True, text=True, timeout=30,
+    )
+    streams = json.loads(result.stdout).get("streams", [{}])
+    s = streams[0] if streams else {}
+    duration = float(s.get("duration") or 0)
+    if not duration:
+        dur_str = (s.get("tags") or {}).get("DURATION", "")
+        if ":" in dur_str:
+            h, m, sec = dur_str.split(":")
+            duration = int(h) * 3600 + int(m) * 60 + float(sec)
+    sample_rate = int(s.get("sample_rate") or 44100)
+    return {"duration": duration, "sample_rate": sample_rate}
 
 
 # ─── 1. Cut / Trim ──────────────────────────────────────────
@@ -114,17 +139,28 @@ def process_join(
     crossfade_ms: int,
     temp_dir: str,
 ) -> str:
-    segments = [AudioSegment.from_file(p) for p in input_paths]
-    if not segments:
+    if not input_paths:
         raise ValueError("No audio files provided")
-    combined = segments[0]
-    for seg in segments[1:]:
-        if crossfade_ms > 0:
-            combined = combined.append(seg, crossfade=min(crossfade_ms, len(combined), len(seg)))
-        else:
-            combined = combined + seg
     out = os.path.join(temp_dir, f"merged.{fmt}")
-    return _export(combined, out, fmt)
+    n = len(input_paths)
+    if crossfade_ms > 0:
+        crossfade_sec = crossfade_ms / 1000.0
+        fc_parts = []
+        for i in range(n - 1):
+            a = f"[cf{i}]" if i > 0 else "[0:a]"
+            b = f"[{i + 1}:a]"
+            label = f"[cf{i + 1}]" if i < n - 2 else "[aout]"
+            fc_parts.append(f"{a}{b}acrossfade=d={crossfade_sec:.3f}:c1=tri:c2=tri{label}")
+        filter_complex = ";".join(fc_parts)
+    else:
+        labels = "".join(f"[{i}:a]" for i in range(n))
+        filter_complex = f"{labels}concat=n={n}:v=0:a=1[aout]"
+    args: list[str] = []
+    for p in input_paths:
+        args += ["-i", p]
+    args += ["-filter_complex", filter_complex, "-map", "[aout]", "-vn", "-y", out]
+    _run_ffmpeg(args)
+    return out
 
 
 # ─── 3. Convert ─────────────────────────────────────────────
@@ -137,11 +173,21 @@ def process_convert(
     temp_dir: str,
     original_name: str,
 ) -> str:
-    audio = AudioSegment.from_file(input_path)
-    if sample_rate:
-        audio = audio.set_frame_rate(sample_rate)
     out = get_output_path(temp_dir, original_name, "converted", fmt)
-    return _export(audio, out, fmt, bitrate)
+    args = ["-i", input_path, "-vn"]
+    if sample_rate:
+        args += ["-ar", str(sample_rate)]
+    if bitrate and fmt in ("mp3", "aac", "ogg", "opus"):
+        args += ["-b:a", bitrate]
+    if fmt == "m4r":
+        mp4_out = out.replace(".m4r", ".mp4")
+        args += ["-y", mp4_out]
+        _run_ffmpeg(args)
+        os.rename(mp4_out, out)
+        return out
+    args += ["-y", out]
+    _run_ffmpeg(args)
+    return out
 
 
 # ─── 4. Volume ──────────────────────────────────────────────
@@ -153,13 +199,12 @@ def process_volume(
     temp_dir: str,
     original_name: str,
 ) -> str:
-    audio = AudioSegment.from_file(input_path)
     if volume_percent <= 0:
         volume_percent = 0.01
-    db_change = 20 * math.log10(volume_percent / 100)
-    adjusted = audio + db_change
+    ratio = volume_percent / 100.0
     out = get_output_path(temp_dir, original_name, "volume", fmt)
-    return _export(adjusted, out, fmt)
+    _run_ffmpeg(["-i", input_path, "-af", f"volume={ratio:.6f}", "-vn", "-y", out])
+    return out
 
 
 # ─── 5. Speed (without pitch change) ────────────────────────
@@ -201,13 +246,10 @@ def process_pitch(
     original_name: str,
 ) -> str:
     out = get_output_path(temp_dir, original_name, "pitch", fmt)
-    # Get original sample rate
-    audio = AudioSegment.from_file(input_path)
-    sr = audio.frame_rate
+    sr = _get_audio_info(input_path)["sample_rate"]
     new_sr = int(sr * (2 ** (semitones / 12)))
-    # asetrate changes pitch, aresample restores original duration
     filter_str = f"asetrate={new_sr},aresample={sr}"
-    _run_ffmpeg(["-i", input_path, "-af", filter_str, "-vn", out])
+    _run_ffmpeg(["-i", input_path, "-af", filter_str, "-vn", "-y", out])
     return out
 
 
@@ -221,13 +263,17 @@ def process_fade(
     temp_dir: str,
     original_name: str,
 ) -> str:
-    audio = AudioSegment.from_file(input_path)
-    if fade_in_sec > 0:
-        audio = audio.fade_in(int(fade_in_sec * 1000))
-    if fade_out_sec > 0:
-        audio = audio.fade_out(int(fade_out_sec * 1000))
     out = get_output_path(temp_dir, original_name, "faded", fmt)
-    return _export(audio, out, fmt)
+    filters: list[str] = []
+    if fade_in_sec > 0:
+        filters.append(f"afade=t=in:st=0:d={fade_in_sec:.3f}")
+    if fade_out_sec > 0:
+        duration = _get_audio_info(input_path)["duration"]
+        fade_start = max(0.0, duration - fade_out_sec)
+        filters.append(f"afade=t=out:st={fade_start:.3f}:d={fade_out_sec:.3f}")
+    filter_str = ",".join(filters) if filters else "anull"
+    _run_ffmpeg(["-i", input_path, "-af", filter_str, "-vn", "-y", out])
+    return out
 
 
 # ─── 8. Reverse ─────────────────────────────────────────────
@@ -238,9 +284,9 @@ def process_reverse(
     temp_dir: str,
     original_name: str,
 ) -> str:
-    audio = AudioSegment.from_file(input_path).reverse()
     out = get_output_path(temp_dir, original_name, "reversed", fmt)
-    return _export(audio, out, fmt)
+    _run_ffmpeg(["-i", input_path, "-af", "areverse", "-vn", "-y", out])
+    return out
 
 
 # ─── 9. Ringtone ────────────────────────────────────────────
@@ -255,17 +301,24 @@ def process_ringtone(
     temp_dir: str,
     original_name: str,
 ) -> str:
-    audio = AudioSegment.from_file(input_path)
-    start_ms = int(start * 1000)
-    end_ms = int(end * 1000)
-    duration_ms = min(end_ms - start_ms, 40000)
-    trimmed = audio[start_ms : start_ms + duration_ms]
-    if fade_in > 0:
-        trimmed = trimmed.fade_in(int(fade_in * 1000))
-    if fade_out > 0:
-        trimmed = trimmed.fade_out(int(fade_out * 1000))
     out = get_output_path(temp_dir, original_name, "ringtone", fmt)
-    return _export(trimmed, out, fmt)
+    duration = min(end - start, 40.0)
+    filters: list[str] = []
+    if fade_in > 0:
+        filters.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out > 0:
+        fade_start = max(0.0, duration - fade_out)
+        filters.append(f"afade=t=out:st={fade_start:.3f}:d={fade_out:.3f}")
+    actual_out = out.replace(".m4r", ".mp4") if fmt == "m4r" else out
+    codec_args: list[str] = ["-c:a", "aac", "-b:a", "192k"] if fmt == "m4r" else []
+    args = ["-ss", str(start), "-i", input_path, "-t", str(duration), "-vn", *codec_args]
+    if filters:
+        args += ["-af", ",".join(filters)]
+    args += ["-y", actual_out]
+    _run_ffmpeg(args)
+    if actual_out != out:
+        os.rename(actual_out, out)
+    return out
 
 
 # ─── 10. Noise Reduction ────────────────────────────────────
@@ -389,29 +442,26 @@ def process_split(
     temp_dir: str,
     original_name: str,
 ) -> str:
-    audio = AudioSegment.from_file(input_path)
-    total_ms = len(audio)
+    total_sec = _get_audio_info(input_path)["duration"]
     base = os.path.splitext(original_name)[0]
 
-    split_points: list[tuple[int, int]] = []
+    split_points: list[tuple[float, float]] = []
     if mode == "duration" and segment_duration > 0:
-        dur_ms = int(segment_duration * 1000)
-        pos = 0
-        while pos < total_ms:
-            split_points.append((pos, min(pos + dur_ms, total_ms)))
-            pos += dur_ms
+        pos = 0.0
+        while pos < total_sec:
+            split_points.append((pos, min(pos + segment_duration, total_sec)))
+            pos += segment_duration
     else:
-        seg_len = total_ms // segments
+        seg_len = total_sec / segments
         for i in range(segments):
-            start = i * seg_len
-            end = total_ms if i == segments - 1 else (i + 1) * seg_len
-            split_points.append((start, end))
+            s = i * seg_len
+            e = total_sec if i == segments - 1 else (i + 1) * seg_len
+            split_points.append((s, e))
 
     segment_paths = []
     for i, (s, e) in enumerate(split_points):
-        seg = audio[s:e]
         seg_path = os.path.join(temp_dir, f"{base}_segment_{i + 1}.{fmt}")
-        _export(seg, seg_path, fmt)
+        _run_ffmpeg(["-ss", str(s), "-i", input_path, "-t", str(e - s), "-vn", "-y", seg_path])
         segment_paths.append(seg_path)
 
     zip_path = os.path.join(temp_dir, f"{base}_segments.zip")
@@ -499,8 +549,7 @@ def process_bass_boost(
     if upper_gain != 0:
         filters.append(f"equalizer=f=500:width_type=o:width=1:gain={upper_gain:.2f}")
     if filters:
-        _run_ffmpeg(["-i", input_path, "-af", ",".join(filters), "-vn", out])
+        _run_ffmpeg(["-i", input_path, "-af", ",".join(filters), "-vn", "-y", out])
     else:
-        audio = AudioSegment.from_file(input_path)
-        _export(audio, out, fmt)
+        _run_ffmpeg(["-i", input_path, "-c:a", "copy", "-vn", "-y", out])
     return out
