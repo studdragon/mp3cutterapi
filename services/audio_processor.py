@@ -53,19 +53,57 @@ def process_cut(
     original_name: str,
     remove_selection: bool = False,
 ) -> str:
-    audio = AudioSegment.from_file(input_path)
-    start_ms = int(start * 1000)
-    end_ms = int(end * 1000)
-    if remove_selection:
-        trimmed = audio[:start_ms] + audio[end_ms:]
-    else:
-        trimmed = audio[start_ms:end_ms]
-    if fade_in > 0:
-        trimmed = trimmed.fade_in(int(fade_in * 1000))
-    if fade_out > 0:
-        trimmed = trimmed.fade_out(int(fade_out * 1000))
     out = get_output_path(temp_dir, original_name, "trimmed", fmt)
-    return _export(trimmed, out, fmt)
+
+    if remove_selection:
+        # Must concat two segments — pydub is simplest here
+        audio = AudioSegment.from_file(input_path)
+        start_ms = int(start * 1000)
+        end_ms = int(end * 1000)
+        trimmed = audio[:start_ms] + audio[end_ms:]
+        if fade_in > 0:
+            trimmed = trimmed.fade_in(int(fade_in * 1000))
+        if fade_out > 0:
+            trimmed = trimmed.fade_out(int(fade_out * 1000))
+        return _export(trimmed, out, fmt)
+
+    # Fast path: direct ffmpeg seek — no full-file decode
+    duration = end - start
+    filters: list[str] = []
+    if fade_in > 0:
+        filters.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out > 0:
+        fade_start = max(0.0, duration - fade_out)
+        filters.append(f"afade=t=out:st={fade_start:.3f}:d={fade_out:.3f}")
+
+    codec_args: list[str] = []
+    if fmt == "mp3":
+        codec_args = ["-c:a", "libmp3lame", "-b:a", "192k"]
+    elif fmt == "wav":
+        codec_args = ["-c:a", "pcm_s16le"]
+    elif fmt == "ogg":
+        codec_args = ["-c:a", "libvorbis"]
+    elif fmt == "flac":
+        codec_args = ["-c:a", "flac"]
+    elif fmt in ("aac", "m4a", "m4r", "m4b"):
+        codec_args = ["-c:a", "aac", "-b:a", "192k"]
+    elif fmt == "opus":
+        codec_args = ["-c:a", "libopus"]
+    else:
+        codec_args = ["-c:a", "copy"]
+
+    args = [
+        "-ss", str(start),
+        "-i", input_path,
+        "-t", str(duration),
+        "-vn",
+        *codec_args,
+    ]
+    if filters:
+        args += ["-af", ",".join(filters)]
+    args += ["-y", out]
+    _run_ffmpeg(args)
+    return out
 
 
 # ─── 2. Join / Merge ────────────────────────────────────────
