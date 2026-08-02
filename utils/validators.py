@@ -1,24 +1,34 @@
+import re
+
 from fastapi import HTTPException
 
 from config import settings
 
-ALLOWED_FORMATS = {"mp3", "wav", "ogg", "flac", "aac", "m4a", "m4r", "opus"}
+ALLOWED_FORMATS = {"mp3", "wav", "ogg", "flac", "aac", "m4a", "m4r"}
+ALLOWED_SPLIT_MODES = {"count", "duration"}
 
-
-def validate_file_size(data: bytes) -> None:
-    max_bytes = settings.max_file_size_mb * 1024 * 1024
-    if len(data) > max_bytes:
-        raise HTTPException(
-            413,
-            f"File too large. Maximum allowed size is {settings.max_file_size_mb} MB.",
-        )
+# ffmpeg accepts forms like "192k", "320K", "128000". Anything else is rejected
+# rather than forwarded, so a caller cannot smuggle extra ffmpeg arguments in.
+_BITRATE_RE = re.compile(r"^\d{1,7}[kK]?$")
 
 
 def validate_format(fmt: str) -> str:
     fmt = fmt.lower().strip()
     if fmt not in ALLOWED_FORMATS:
-        raise HTTPException(400, f"Unsupported format: {fmt}. Allowed: {', '.join(sorted(ALLOWED_FORMATS))}")
+        raise HTTPException(
+            400,
+            f"Unsupported format: {fmt}. Allowed: {', '.join(sorted(ALLOWED_FORMATS))}",
+        )
     return fmt
+
+
+def validate_bitrate(bitrate: str) -> str | None:
+    bitrate = (bitrate or "").strip()
+    if not bitrate:
+        return None
+    if not _BITRATE_RE.match(bitrate):
+        raise HTTPException(400, "Bitrate must look like '192k' or '192000'")
+    return bitrate
 
 
 def validate_time_range(start: float, end: float) -> None:
@@ -65,12 +75,62 @@ def validate_compression(
         raise HTTPException(400, "Threshold must be between -100 and 0 dB")
     if not (1 <= ratio <= 100):
         raise HTTPException(400, "Ratio must be between 1 and 100")
-    if not (0 <= attack <= 2000):
-        raise HTTPException(400, "Attack must be between 0 and 2000 ms")
-    if not (0 <= release <= 9000):
-        raise HTTPException(400, "Release must be between 0 and 9000 ms")
+    if not (0 <= attack <= 1):
+        raise HTTPException(400, "Attack must be between 0 and 1 seconds")
+    if not (0 <= release <= 5):
+        raise HTTPException(400, "Release must be between 0 and 5 seconds")
 
 
 def validate_volume(volume_percent: float) -> None:
     if not (0 < volume_percent <= 1000):
         raise HTTPException(400, "Volume must be between 0 and 1000 percent")
+
+
+def validate_gain_db(gain: float, label: str = "Gain") -> None:
+    if not (-24 <= gain <= 24):
+        raise HTTPException(400, f"{label} must be between -24 and 24 dB, got {gain}")
+
+
+def validate_split(mode: str, segments: int, segment_duration: float) -> str:
+    """Guard /split, which previously accepted any segment count.
+
+    segments=0 raised ZeroDivisionError (a 500), and a large count or a tiny
+    duration turned a modest upload into hundreds of thousands of files.
+    """
+    mode = (mode or "count").strip().lower()
+    if mode not in ALLOWED_SPLIT_MODES:
+        raise HTTPException(
+            400,
+            f"Unsupported split mode: {mode}. Allowed: {', '.join(sorted(ALLOWED_SPLIT_MODES))}",
+        )
+
+    if mode == "count":
+        if segments < 2:
+            raise HTTPException(400, "Segment count must be at least 2")
+        if segments > settings.max_split_segments:
+            raise HTTPException(
+                400,
+                f"Segment count must be at most {settings.max_split_segments}",
+            )
+    else:
+        if segment_duration < settings.min_segment_duration_seconds:
+            raise HTTPException(
+                400,
+                f"Segment duration must be at least "
+                f"{settings.min_segment_duration_seconds} seconds",
+            )
+
+    return mode
+
+
+def validate_segment_yield(total_ms: int, segment_duration: float) -> None:
+    """Reject duration-mode splits that would emit too many files."""
+    if segment_duration <= 0:
+        raise HTTPException(400, "Segment duration must be greater than zero")
+    projected = int(total_ms // int(segment_duration * 1000)) + 1
+    if projected > settings.max_split_segments:
+        raise HTTPException(
+            400,
+            f"That segment duration would produce {projected} files; the maximum "
+            f"is {settings.max_split_segments}. Use a longer duration.",
+        )
