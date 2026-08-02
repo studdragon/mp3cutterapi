@@ -4,7 +4,26 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    allowed_origins: str = "http://localhost:3000"
+    # Browser origins allowed to call this API, comma separated. Becomes
+    # CORSMiddleware's allow_origins in main.py.
+    #
+    # An origin missing from this list does not produce a helpful error: Starlette
+    # simply omits the Access-Control-Allow-Origin header, the request succeeds
+    # and logs a 200, and the browser discards the response. It reads as a network
+    # fault on the front end while the server looks perfectly healthy.
+    #
+    # Matched exactly on scheme, host and port, so http and https differ, www and
+    # non-www differ, and a trailing slash breaks the match. main.py strips
+    # trailing slashes defensively.
+    #
+    # 4321 is the Astro dev server, 3000 the older Next.js one. Override with
+    # ALLOWED_ORIGINS to add a staging or preview domain without editing code.
+    allowed_origins: str = (
+        "https://mp3cutteronline.com,"
+        "https://www.mp3cutteronline.com,"
+        "http://localhost:4321,"
+        "http://localhost:3000"
+    )
     temp_dir: str = os.path.join(tempfile.gettempdir(), "mp3cutter")
     max_file_size_mb: int = 500
     ffmpeg_path: str = "ffmpeg"

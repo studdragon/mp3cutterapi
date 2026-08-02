@@ -101,7 +101,10 @@ async def guard_request(request: Request, call_next):
 # CORS. expose_headers is required for the browser to read Content-Disposition
 # cross-origin; without it the client cannot recover the real download filename
 # and falls back to a guessed name and extension.
-origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+# rstrip("/") because CORS origins are compared exactly: a stray trailing slash in
+# ALLOWED_ORIGINS silently fails to match and looks identical to the origin having
+# been left out altogether.
+origins = [o.strip().rstrip("/") for o in settings.allowed_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
